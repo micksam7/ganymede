@@ -11,6 +11,8 @@ import (
 
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/viper"
+	entChannel "github.com/zibbp/ganymede/ent/channel"
+	entVod "github.com/zibbp/ganymede/ent/vod"
 	"github.com/zibbp/ganymede/internal/chapter"
 	"github.com/zibbp/ganymede/internal/database"
 	"github.com/zibbp/ganymede/internal/dto"
@@ -381,6 +383,32 @@ func DownloadTwitchLiveVideo(ctx context.Context, input dto.ArchiveVideoInput, c
 	if dbErr != nil {
 		cancel()
 		return dbErr
+	}
+
+	// attempt to find vod id of the livesstream so the external id is correct
+	videos, err := twitch.GetVideosByUser(input.Channel.ExtID, "archive")
+	if err != nil {
+		cancel()
+		return temporal.NewApplicationError(err.Error(), "", nil)
+	}
+
+	// attempt to find vod of current livestream
+	var livestreamVodId string
+	for _, video := range videos {
+		if video.StreamID == input.Vod.ExtID {
+			livestreamVodId = video.ID
+			log.Info().Msgf("found vod id %s for livestream %s, updating database", livestreamVodId, input.Vod.ExtID)
+			// update vod with external id
+			_, dbErr = database.DB().Client.Vod.UpdateOneID(input.Vod.ID).SetExtID(livestreamVodId).Save(ctx)
+			if dbErr != nil {
+				cancel()
+				return temporal.NewApplicationError(err.Error(), "", nil)
+			}
+		}
+	}
+
+	if livestreamVodId == "" {
+		log.Info().Msgf("no vod found for livestream %s, keeping live stream ID as external id", input.Vod.ExtID)
 	}
 
 	cancel()
@@ -882,18 +910,17 @@ func ConvertTwitchLiveChat(ctx context.Context, input dto.ArchiveVideoInput) err
 		return temporal.NewApplicationError(err.Error(), "", nil)
 	}
 
-	// loop through videos and find the one that matches vExtID
+	// attempt to find vod of current livestream
 	var previousVideoID string
 	for _, video := range videos {
 		if video.StreamID == input.Vod.ExtID {
 			previousVideoID = video.ID
 		}
 	}
-	// If no previous video ID was found, use the current video ID
+	// If no previous video ID was found, use a random id
 	if previousVideoID == "" {
-		cancel()
-		log.Warn().Msgf("Unable to convert chat due to no previous video IDs")
-		// TODO: exit gracefully
+		log.Warn().Msgf("Stream %s on channel %s has no previous video ID, using %s", input.VideoID, input.Channel.Name, previousVideoID)
+		previousVideoID = "132195945"
 	}
 
 	err = utils.ConvertTwitchLiveChatToVodChat(fmt.Sprintf("/tmp/%s_%s-live-chat.json", input.Vod.ExtID, input.Vod.ID), input.Channel.Name, input.Vod.ID.String(), input.Vod.ExtID, cID, input.Queue.ChatStart, string(previousVideoID))
@@ -1024,6 +1051,75 @@ func TwitchSaveVideoChapters(ctx context.Context) error {
 		}
 		// sleep for 0.25 seconds to not hit rate limit
 		time.Sleep(250 * time.Millisecond)
+	}
+	cancel()
+	return nil
+}
+
+func UpdateTwitchLiveStreamArchivesWithVodIds(ctx context.Context) error {
+	// Create a new context with cancel
+	heartbeatCtx, cancel := context.WithCancel(context.Background())
+	defer cancel() // Make sure to cancel when download is complete
+
+	// Start a goroutine that sends a heartbeat every 30 seconds
+	go func() {
+		for {
+			select {
+			case <-heartbeatCtx.Done():
+				// If the context is done, stop the goroutine
+				return
+			default:
+				// Otherwise, record a heartbeat and sleep for 30 seconds
+				activity.RecordHeartbeat(ctx, "my-heartbeat")
+				time.Sleep(30 * time.Second)
+			}
+		}
+	}()
+
+	// get all channels
+	channels, err := database.DB().Client.Channel.Query().All(ctx)
+	if err != nil {
+		cancel()
+		return temporal.NewApplicationError(err.Error(), "", nil)
+	}
+
+	for _, channel := range channels {
+		log.Info().Msgf("processing channel %s", channel.Name)
+		// get all videos for channel
+		videos, err := database.DB().Client.Vod.Query().Where(entVod.HasChannelWith(entChannel.ID(channel.ID))).All(ctx)
+		if err != nil {
+			cancel()
+			return temporal.NewApplicationError(err.Error(), "", nil)
+		}
+
+		// get all videos from twitch for channel
+		twitchChannelVideoss, err := twitch.GetVideosByUser(channel.ExtID, "archive")
+		if err != nil {
+			cancel()
+			return temporal.NewApplicationError(err.Error(), "", nil)
+		}
+
+		for _, video := range videos {
+			if video.Type != "live" {
+				continue
+			}
+			if video.ExtID == "" {
+				continue
+			}
+			// find video in twitch videos
+			for _, twitchVideo := range twitchChannelVideoss {
+				if video.ExtID == twitchVideo.StreamID {
+					log.Debug().Msgf("found video %s in twitch videos", video.ExtID)
+					// update video with vod id
+					_, err := database.DB().Client.Vod.UpdateOneID(video.ID).SetExtID(twitchVideo.ID).Save(ctx)
+					if err != nil {
+						cancel()
+						return temporal.NewApplicationError(err.Error(), "", nil)
+					}
+				}
+			}
+
+		}
 	}
 	cancel()
 	return nil
