@@ -251,7 +251,9 @@ func DownloadTwitchLiveThumbnails(ctx context.Context, input dto.ArchiveVideoInp
 		if dbErr != nil {
 			return dbErr
 		}
-		return fmt.Errorf("no stream found for channel %s", input.Channel.Name)
+		// stream isn't live so archive shouldn't continue and should be cleaned up
+		// TODO: clean up entire archive thus far
+		return temporal.NewApplicationError(fmt.Sprintf("no stream found for channel %s", input.Channel.Name), "", nil)
 	}
 
 	twitchVideo := stream.Data[0]
@@ -344,7 +346,7 @@ func DownloadTwitchLiveVideo(ctx context.Context, input dto.ArchiveVideoInput, c
 		_, dbErr := database.DB().Client.Queue.UpdateOneID(input.Queue.ID).SetTaskVideoDownload(utils.Failed).Save(ctx)
 		if dbErr != nil {
 			stopHeartbeat <- true
-			return dbErr
+			return temporal.NewApplicationError(err.Error(), "", nil)
 		}
 		stopHeartbeat <- true
 		return temporal.NewApplicationError(err.Error(), "", nil)
@@ -353,7 +355,7 @@ func DownloadTwitchLiveVideo(ctx context.Context, input dto.ArchiveVideoInput, c
 	_, dbErr = database.DB().Client.Queue.UpdateOneID(input.Queue.ID).SetTaskVideoDownload(utils.Success).Save(ctx)
 	if dbErr != nil {
 		stopHeartbeat <- true
-		return dbErr
+		return temporal.NewApplicationError(err.Error(), "", nil)
 	}
 
 	// Update video duration with duration from downloaded video
